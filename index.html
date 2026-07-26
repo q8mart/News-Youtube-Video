@@ -243,6 +243,8 @@ function App() {
   const stageCanvasRef = useRef(null);
   const recorderRef = useRef(null);
   const chunksRef = useRef([]);
+  const fixedBlobRef = useRef(null);
+  const rawBlobRef = useRef(null);
   const animRef = useRef(null);
   const imgCacheRef = useRef({});
   const logoImgRef = useRef(null);
@@ -292,7 +294,7 @@ function App() {
     return () => { stop = true; clearInterval(id); };
   }, []);
 
-  // detect local Voicebox app + resolve the "jujar" cloned voice profile id
+  // detect Voicebox backend (Render) + resolve the "jujar" cloned voice profile id
   useEffect(() => {
     let stop = false;
     async function ping() {
@@ -909,54 +911,146 @@ function App() {
     playNext();
   }
 
+  function triggerFileDownload(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.download = filename;
+    link.href = url;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    return url;
+  }
+
+  // Chrome's canvas-recorded WebM files don't carry a proper "duration" in their
+  // header. Some players then show it as blank/broken until this is patched in.
+  // This runs ONLY in the background, after the real download already happened —
+  // it never blocks or delays the download itself, and if the network/library
+  // isn't available it just quietly does nothing.
+  function fixWebmDurationInBackground(blob, durationMs) {
+    const withTimeout = (p, ms) => Promise.race([
+      p,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))
+    ]);
+    withTimeout(import('https://esm.sh/ts-ebml@2.0.2'), 4000).then(async (mod) => {
+      const { Decoder, Encoder, tools } = mod;
+      const buf = await blob.arrayBuffer();
+      const decoder = new Decoder();
+      const elms = decoder.decode(buf);
+      const reader = new tools.Reader();
+      reader.logging = false;
+      reader.drop_default_duration = false;
+      elms.forEach(elm => reader.read(elm));
+      reader.stop();
+      if (!reader.duration || !isFinite(reader.duration)) reader.duration = durationMs;
+      const encoder = new Encoder();
+      const metadataBuf = encoder.encode(reader.metadatas);
+      const body = buf.slice(reader.metadataSize);
+      const fixedBlob = new Blob([metadataBuf, body], { type: blob.type });
+      fixedBlobRef.current = fixedBlob;
+      setVideoUrl(URL.createObjectURL(fixedBlob));
+    }).catch(() => { /* offline or lib unavailable — original download already worked, nothing more to do */ });
+  }
+
   async function recordAndDownload() {
+    if (!window.MediaRecorder || !stageCanvasRef.current || typeof stageCanvasRef.current.captureStream !== 'function') {
+      setRecStatus("⚠ Ye browser video recording support nahi karta. Kripya latest Chrome ya Edge me kholo.");
+      return;
+    }
     ensureAudio();
-    const capturable = edgeOkRef.current || !!vrKey;
+    const capturable = voiceboxOkRef.current || edgeOkRef.current || !!vrKey;
     if (!capturable) {
       setRecStatus("⚠ Aawaz record karne ke liye pehle VoiceRSS key daalo (ya local Hindi voice server chalao). Warna video silent banegi.");
     }
     try {
       const canvasStream = stageCanvasRef.current.captureStream(30);
-      const audioTracks = audioDestRef.current ? audioDestRef.current.stream.getAudioTracks() : [];
+      // Only add the audio track when it will actually carry real sound
+      // (edge-tts / VoiceRSS configured). An audio track that never receives
+      // any data — as happens with the silent browser-voice fallback — can
+      // make Chrome's MediaRecorder produce ZERO output for the whole
+      // recording (video included), which is exactly the "khaali recording"
+      // problem. Safer to record video-only in that case.
+      const audioTracks = (capturable && audioDestRef.current) ? audioDestRef.current.stream.getAudioTracks() : [];
       const combined = new MediaStream([...canvasStream.getVideoTracks(), ...audioTracks]);
+      if (!combined.getVideoTracks().length) {
+        setRecStatus("⚠ Recording start nahi ho payi: canvas se video track nahi mili. Browser update karke dobara try karo.");
+        return;
+      }
 
       let mime = 'video/webm;codecs=vp9,opus';
       if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
       const recorder = new MediaRecorder(combined, { mimeType: mime, videoBitsPerSecond: 6000000 });
       chunksRef.current = [];
-      recorder.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+      fixedBlobRef.current = null;
+      rawBlobRef.current = null;
+      const recStart = performance.now();
+      recorder.ondataavailable = e => { if (e.data && e.data.size > 0) chunksRef.current.push(e.data); };
+      recorder.onerror = (e) => {
+        setRecStatus("⚠ Recording error: " + (e.error ? e.error.message : 'unknown error'));
+        setRecording(false);
+      };
       recorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: 'video/webm' });
-        const url = URL.createObjectURL(blob);
-        setVideoUrl(url);
-        const link = document.createElement('a');
-        link.download = 'news-video.webm';
-        link.href = url;
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        setRecStatus("✓ Video ban gayi aur apne-aap download ho gayi. (neeche preview bhi hai)");
+        setRecording(false);
+        try {
+          if (!chunksRef.current.length) {
+            setRecStatus("⚠ Recording khaali aayi, kuch record nahi hua. Dobara 'Record & Download' try karo.");
+            return;
+          }
+          const durationMs = performance.now() - recStart;
+          const rawBlob = new Blob(chunksRef.current, { type: 'video/webm' });
+          // NOTE: we deliberately do NOT auto-trigger the download here. Chrome
+          // silently blocks downloads that aren't a direct response to a click —
+          // and by the time recording finishes (many seconds later, through
+          // several async steps) it no longer counts as "direct". So we just
+          // prepare the file and ask the user to click the button themselves,
+          // which Chrome always allows.
+          rawBlobRef.current = rawBlob;
+          setVideoUrl(URL.createObjectURL(rawBlob));
+          setRecStatus("✓ Video taiyar hai — neeche '⬇ Video Download Karo' button dabao.");
+          // optional background touch-up for wider player compatibility
+          fixWebmDurationInBackground(rawBlob, durationMs);
+        } catch (err) {
+          console.error('onstop failed:', err);
+          setRecStatus("⚠ Video save karte waqt error aayi: " + err.message);
+        }
       };
       recorderRef.current = recorder;
-      recorder.start();
+      // request a chunk every 250ms instead of only at the end — avoids a single
+      // giant final chunk that some browsers fail to flush cleanly on stop()
+      recorder.start(250);
       setRecording(true);
       if (capturable) setRecStatus("Recording chal rahi hai — bina popup ke. Ban-te hi apne-aap download hogi.");
       playAll(() => {
         setTimeout(() => {
-          if (recorderRef.current && recorderRef.current.state !== 'inactive') recorderRef.current.stop();
-          setRecording(false);
+          if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+            if (typeof recorderRef.current.requestData === 'function') {
+              try { recorderRef.current.requestData(); } catch (e) {}
+            }
+            recorderRef.current.stop();
+          }
         }, 600);
       }, true);
     } catch (err) {
-      setRecStatus("Recording start nahi ho payi: " + err.message);
+      console.error('recordAndDownload failed:', err);
+      setRecStatus("⚠ Recording start nahi ho payi: " + err.message);
     }
   }
 
   function downloadVideo() {
-    const link = document.createElement('a');
-    link.download = 'news-video.webm';
-    link.href = videoUrl;
-    link.click();
+    // prefer the background-improved (correct-duration) file if it's ready yet,
+    // otherwise fall back to the original recording — either way this is a
+    // direct click handler, so Chrome always allows the download through.
+    const blob = fixedBlobRef.current || rawBlobRef.current;
+    if (blob) {
+      triggerFileDownload(blob, 'news-video.webm');
+    } else if (videoUrl) {
+      const link = document.createElement('a');
+      link.download = 'news-video.webm';
+      link.href = videoUrl;
+      link.click();
+    } else {
+      setRecStatus("⚠ Abhi koi video taiyar nahi hai. Pehle 'Record & Download Video' dabao.");
+    }
   }
 
   function stopPlay() {
@@ -1074,12 +1168,12 @@ function App() {
         <h2 style={{fontSize:15, color:'#b91c1c'}}>Step 2 — Preview aur Voice Settings</h2>
         <div style={{background: (voiceboxOk||edgeOk||vrKey) ? '#ecfdf3' : '#fff7ed', border:'1px solid '+((voiceboxOk||edgeOk||vrKey)?'#12b76a':'#f59e0b'), borderRadius:8, padding:'10px 12px', marginBottom:14, fontSize:13}}>
           {voiceboxOk
-            ? <span style={{color:'#067647', fontWeight:700}}>🎙️ Voicebox ON — jujar cloned voice use hogi (best quality, no popup).</span>
+            ? <span style={{color:'#067647', fontWeight:700}}>🎙️ Jujar cloned voice ON (Voicebox) — recording ki aawaz aayegi (no popup).</span>
             : edgeOk
               ? <span style={{color:'#067647', fontWeight:700}}>🎙️ Local Hindi voice ON — recording ki aawaz aayegi (no popup).</span>
               : vrKey
                 ? <span style={{color:'#067647', fontWeight:700}}>🎙️ VoiceRSS ON — recording ki aawaz aayegi (no popup).</span>
-                : <span style={{color:'#b45309', fontWeight:700}}>⚠ Voicebox app kholo (jujar voice ke saath), ya neeche VoiceRSS key daalo. Warna video silent banegi.</span>}
+                : <span style={{color:'#b45309', fontWeight:700}}>⚠ Recordable Hindi aawaz ke liye neeche VoiceRSS key daalo (ek baar). Warna video silent banegi.</span>}
         </div>
         <div className="controls" style={{marginBottom:14}}>
           <label>VoiceRSS Key: </label>
@@ -1123,7 +1217,7 @@ function App() {
         {recStatus && <div style={{fontSize:12, color:'#b91c1c', marginTop:8, textAlign:'center'}}>{recStatus}</div>}
         {videoUrl && <div style={{textAlign:'center', marginTop:10}}>
           <video src={videoUrl} controls style={{maxWidth:300, borderRadius:8}}></video><br/>
-          <button className="btn secondary" style={{marginTop:8}} onClick={downloadVideo}>Download Again (.webm)</button>
+          <button className="btn" style={{marginTop:10, fontWeight:800}} onClick={downloadVideo}>⬇ Video Download Karo</button>
         </div>}
       </div>
 
